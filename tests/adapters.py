@@ -30,8 +30,12 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
+    # 校验weights的形状
+    assert weights.shape == (d_out, d_in)
+    # 校验in_features的形状是否正确
+    assert in_features.shape[-1] == d_in
+    # 计算输出
+    return in_features @ weights.T
 
 
 def run_embedding(
@@ -52,9 +56,12 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
+    # 校验weights的形状
+    assert weights.shape == (vocab_size, d_model)
+    # 校验token_ids的值是否在[0, vocab_size)范围内
+    assert torch.all(token_ids >= 0) and torch.all(token_ids < vocab_size)
 
-    raise NotImplementedError
-
+    return weights[token_ids]
 
 def run_swiglu(
     d_model: int,
