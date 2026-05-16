@@ -92,7 +92,14 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    w_1 = in_features @ w1_weight.T
+    w_3 = in_features @ w3_weight.T
+    w_gate = w_1 * torch.sigmoid(w_1)
+
+    hidden = w_3 * w_gate
+
+    return hidden @ w2_weight.T
+
 
 
 def run_scaled_dot_product_attention(
@@ -387,7 +394,10 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    rms = torch.sqrt(torch.mean(in_features * in_features, dim=-1, keepdim=True) + eps)
+    norm_features = in_features / rms
+    
+    return norm_features * weights
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -401,7 +411,8 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+
+    return in_features * torch.sigmoid(in_features)
 
 
 def run_get_batch(
@@ -440,7 +451,11 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    in_features = in_features - torch.max(in_features, dim=dim, keepdim=True).values
+    exp_features = torch.exp(in_features)
+    softmax = exp_features / torch.sum(exp_features, dim=dim, keepdim=True)
+    
+    return softmax
 
 
 def run_cross_entropy(
