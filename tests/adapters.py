@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
@@ -120,7 +121,12 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    scores = Q @ K.transpose(-2, -1) / math.sqrt(Q.shape[-1])
+    if mask is not None:
+        scores = scores.masked_fill(~mask, float("-inf"))
+    attn = run_softmax(scores, dim=-1)
+
+    return attn @ V
 
 
 def run_multihead_self_attention(
@@ -133,28 +139,106 @@ def run_multihead_self_attention(
     in_features: Float[Tensor, " ... sequence_length d_in"],
 ) -> Float[Tensor, " ... sequence_length d_out"]:
     """
-    Given the key, query, and value projection weights of a naive unbatched
-    implementation of multi-head attention, return the output of an optimized batched
-    implementation. This implementation should handle the key, query, and value projections
-    for all heads in a single matrix multiply.
-    This function should not use RoPE.
-    See section 3.2.2 of Vaswani et al., 2017.
+    Multi-head self-attention without RoPE.
 
-    Args:
-        d_model (int): Dimensionality of the feedforward input and output.
-        num_heads (int): Number of heads to use in multi-headed attention.
-        max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
-        q_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the Q projection
-        k_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the K projection
-        v_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the V projection
-        o_proj_weight (Float[Tensor, "d_model d_v"]): Weights for the output projection
-        in_features (Float[Tensor, "... sequence_length d_in"]): Tensor to run your implementation on.
+    输入:
+        in_features: [..., seq_len, d_in]
 
-    Returns:
-        Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
-        implementation with the given QKV projection weights and input features.
+    投影后:
+        Q: [..., seq_len, d_k]
+        K: [..., seq_len, d_k]
+        V: [..., seq_len, d_v]
+
+    分 head 后:
+        Q: [..., num_heads, seq_len, head_dim_qk]
+        K: [..., num_heads, seq_len, head_dim_qk]
+        V: [..., num_heads, seq_len, head_dim_v]
+
+    输出:
+        [..., seq_len, d_model]
     """
-    raise NotImplementedError
+
+    x = in_features
+    seq_len = x.shape[-2]
+
+    d_k = q_proj_weight.shape[0]
+    d_v = v_proj_weight.shape[0]
+
+    if d_k % num_heads != 0:
+        raise ValueError(f"d_k={d_k} must be divisible by num_heads={num_heads}")
+
+    if d_v % num_heads != 0:
+        raise ValueError(f"d_v={d_v} must be divisible by num_heads={num_heads}")
+
+    if k_proj_weight.shape[0] != d_k:
+        raise ValueError("q_proj_weight and k_proj_weight must have same output dimension d_k")
+
+    if o_proj_weight.shape[0] != d_model:
+        raise ValueError("o_proj_weight first dimension should be d_model")
+
+    if o_proj_weight.shape[1] != d_v:
+        raise ValueError("o_proj_weight second dimension should be d_v")
+
+    head_dim_qk = d_k // num_heads
+    head_dim_v = d_v // num_heads
+
+    Q = run_linear(
+        d_in=q_proj_weight.shape[1],
+        d_out=q_proj_weight.shape[0],
+        weights=q_proj_weight,
+        in_features=x,
+    )
+    K = run_linear(
+        d_in=k_proj_weight.shape[1],
+        d_out=k_proj_weight.shape[0],
+        weights=k_proj_weight,
+        in_features=x,
+    )
+    V = run_linear(
+        d_in=v_proj_weight.shape[1],
+        d_out=v_proj_weight.shape[0],
+        weights=v_proj_weight,
+        in_features=x,
+    )
+
+    # 原始 shape:
+    # Q: [..., seq_len, d_k]
+    # K: [..., seq_len, d_k]
+    # V: [..., seq_len, d_v]
+
+    # 分成多个 head
+    # [..., seq_len, d_k] -> [..., seq_len, num_heads, head_dim_qk]
+    Q = Q.reshape(*Q.shape[:-1], num_heads, head_dim_qk)
+    K = K.reshape(*K.shape[:-1], num_heads, head_dim_qk)
+    V = V.reshape(*V.shape[:-1], num_heads, head_dim_v)
+
+    # 把 head 维度移到 seq_len 前面
+    # [..., seq_len, num_heads, head_dim] -> [..., num_heads, seq_len, head_dim]
+    Q = Q.transpose(-3, -2)
+    K = K.transpose(-3, -2)
+    V = V.transpose(-3, -2)
+
+    mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device))
+    context = run_scaled_dot_product_attention(Q, K, V, mask)
+
+    # 把 head 拼回去
+    # [..., num_heads, seq_len, head_dim_v]
+    # -> [..., seq_len, num_heads, head_dim_v]
+    context = context.transpose(-3, -2)
+
+    # -> [..., seq_len, d_v]
+    context = context.reshape(*x.shape[:-2], seq_len, d_v)
+
+    # 输出投影
+    # [..., seq_len, d_v] -> [..., seq_len, d_model]
+    out = run_linear(
+        d_in=o_proj_weight.shape[1],
+        d_out=o_proj_weight.shape[0],
+        weights=o_proj_weight,
+        in_features=context,
+    )
+
+    return out
 
 
 def run_multihead_self_attention_with_rope(
@@ -194,7 +278,65 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    x = in_features
+    seq_len = x.shape[-2]
+
+    d_k = q_proj_weight.shape[0]
+    d_v = v_proj_weight.shape[0]
+    head_dim_qk = d_k // num_heads
+    head_dim_v = d_v // num_heads
+
+    Q = run_linear(
+        d_in=q_proj_weight.shape[1],
+        d_out=q_proj_weight.shape[0],
+        weights=q_proj_weight,
+        in_features=x,
+    )
+    K = run_linear(
+        d_in=k_proj_weight.shape[1],
+        d_out=k_proj_weight.shape[0],
+        weights=k_proj_weight,
+        in_features=x,
+    )
+    V = run_linear(
+        d_in=v_proj_weight.shape[1],
+        d_out=v_proj_weight.shape[0],
+        weights=v_proj_weight,
+        in_features=x,
+    )
+
+    Q = Q.reshape(*Q.shape[:-1], num_heads, head_dim_qk).transpose(-3, -2)
+    K = K.reshape(*K.shape[:-1], num_heads, head_dim_qk).transpose(-3, -2)
+    V = V.reshape(*V.shape[:-1], num_heads, head_dim_v).transpose(-3, -2)
+
+    if token_positions is None:
+        token_positions = torch.arange(seq_len, device=x.device)
+
+    Q = run_rope(
+        d_k=head_dim_qk,
+        theta=theta,
+        max_seq_len=max_seq_len,
+        in_query_or_key=Q,
+        token_positions=token_positions,
+    )
+    K = run_rope(
+        d_k=head_dim_qk,
+        theta=theta,
+        max_seq_len=max_seq_len,
+        in_query_or_key=K,
+        token_positions=token_positions,
+    )
+
+    mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device))
+    context = run_scaled_dot_product_attention(Q, K, V, mask)
+
+    context = context.transpose(-3, -2).reshape(*x.shape[:-2], seq_len, d_v)
+    return run_linear(
+        d_in=o_proj_weight.shape[1],
+        d_out=o_proj_weight.shape[0],
+        weights=o_proj_weight,
+        in_features=context,
+    )
 
 
 def run_rope(
@@ -205,18 +347,75 @@ def run_rope(
     token_positions: Int[Tensor, " ... sequence_length"],
 ) -> Float[Tensor, " ... sequence_length d_k"]:
     """
-    Run RoPE for a given input tensor.
+    Run RoPE on a query or key tensor.
 
-    Args:
-        d_k (int): Embedding dimension size for the query or key tensor.
-        theta (float): RoPE parameter.
-        max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
-        in_query_or_key (Float[Tensor, "... sequence_length d_k"]): Input tensor to run RoPE on.
-        token_positions (Int[Tensor, "... sequence_length"]): Tensor of shape (batch_size, sequence_length) with the token positions
-    Returns:
-        Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
+    RoPE 会把最后一维 d_k 按两两一组：
+        (x0, x1), (x2, x3), ...
+
+    对第 i 组使用角度：
+        angle_i(pos) = pos / theta^(2i / d_k)
+
+    然后做二维旋转：
+        x_even' = x_even * cos(angle) - x_odd * sin(angle)
+        x_odd'  = x_even * sin(angle) + x_odd * cos(angle)
     """
-    raise NotImplementedError
+
+    x = in_query_or_key
+
+    if d_k % 2 != 0:
+        raise ValueError("RoPE requires d_k to be even.")
+
+    if x.shape[-1] != d_k:
+        raise ValueError(f"Expected last dimension to be d_k={d_k}, got {x.shape[-1]}.")
+
+    device = x.device
+    orig_dtype = x.dtype
+
+    # 用 float32 算 sin/cos 更稳定
+    compute_dtype = torch.float32
+
+    # 1. 拆成偶数维和奇数维
+    # x_even: [..., sequence_length, d_k / 2]
+    # x_odd:  [..., sequence_length, d_k / 2]
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+
+    # 2. 计算每一组维度的 inverse frequency
+    # i = 0, 1, 2, ..., d_k/2 - 1
+    # inv_freq_i = 1 / theta^(2i / d_k)
+    i = torch.arange(0, d_k // 2, device=device, dtype=compute_dtype)
+    inv_freq = 1.0 / (theta ** (2 * i / d_k))
+
+    # 3. 处理 token_positions 的 shape，让它能 broadcast 到 x_even
+    # token_positions: [..., sequence_length]
+    positions = token_positions.to(device=device)
+
+    # 如果 x 有 head 维度，比如 x: [batch, heads, seq_len, d_k]
+    # 但 positions 是 [batch, seq_len]，这里会自动补一个维度：
+    # [batch, seq_len] -> [batch, 1, seq_len]
+    while positions.ndim < x.ndim - 1:
+        positions = positions.unsqueeze(-2)
+
+    # 4. 计算 angle
+    # positions[..., None]: [..., sequence_length, 1]
+    # inv_freq:           [d_k / 2]
+    # angles:             [..., sequence_length, d_k / 2]
+    angles = positions.to(dtype=compute_dtype)[..., None] * inv_freq
+
+    # 5. 计算 cos 和 sin
+    cos = torch.cos(angles).to(dtype=orig_dtype)
+    sin = torch.sin(angles).to(dtype=orig_dtype)
+
+    # 6. 二维旋转
+    out_even = x_even * cos - x_odd * sin
+    out_odd = x_even * sin + x_odd * cos
+
+    # 7. 拼回原来的 d_k 维度
+    out = torch.empty_like(x)
+    out[..., 0::2] = out_even
+    out[..., 1::2] = out_odd
+
+    return out
 
 
 def run_transformer_block(
@@ -289,7 +488,40 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    normed = run_rmsnorm(
+        d_model=d_model,
+        eps=1e-5,
+        weights=weights["ln1.weight"],
+        in_features=in_features,
+    )
+    attn_out = run_multihead_self_attention_with_rope(
+        d_model=d_model,
+        num_heads=num_heads,
+        max_seq_len=max_seq_len,
+        theta=theta,
+        q_proj_weight=weights["attn.q_proj.weight"],
+        k_proj_weight=weights["attn.k_proj.weight"],
+        v_proj_weight=weights["attn.v_proj.weight"],
+        o_proj_weight=weights["attn.output_proj.weight"],
+        in_features=normed,
+    )
+    h = in_features + attn_out
+
+    normed = run_rmsnorm(
+        d_model=d_model,
+        eps=1e-5,
+        weights=weights["ln2.weight"],
+        in_features=h,
+    )
+    ffn_out = run_swiglu(
+        d_model=d_model,
+        d_ff=d_ff,
+        w1_weight=weights["ffn.w1.weight"],
+        w2_weight=weights["ffn.w2.weight"],
+        w3_weight=weights["ffn.w3.weight"],
+        in_features=normed,
+    )
+    return h + ffn_out
 
 
 def run_transformer_lm(
@@ -371,7 +603,43 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    x = run_embedding(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        weights=weights["token_embeddings.weight"],
+        token_ids=in_indices,
+    )
+
+    for layer_idx in range(num_layers):
+        prefix = f"layers.{layer_idx}."
+        layer_weights = {
+            key.removeprefix(prefix): value
+            for key, value in weights.items()
+            if key.startswith(prefix)
+        }
+        x = run_transformer_block(
+            d_model=d_model,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            max_seq_len=context_length,
+            theta=rope_theta,
+            weights=layer_weights,
+            in_features=x,
+        )
+
+    x = run_rmsnorm(
+        d_model=d_model,
+        eps=1e-5,
+        weights=weights["ln_final.weight"],
+        in_features=x,
+    )
+
+    return run_linear(
+        d_in=d_model,
+        d_out=vocab_size,
+        weights=weights["lm_head.weight"],
+        in_features=x,
+    )
 
 
 def run_rmsnorm(
@@ -435,7 +703,18 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    starts = torch.randint(
+        low=0,
+        high=len(dataset) - context_length,
+        size=(batch_size,),
+    )
+    x = torch.stack(
+        [torch.as_tensor(dataset[start : start + context_length], dtype=torch.long) for start in starts]
+    )
+    y = torch.stack(
+        [torch.as_tensor(dataset[start + 1 : start + context_length + 1], dtype=torch.long) for start in starts]
+    )
+    return x.to(device), y.to(device)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -473,7 +752,9 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    log_denom = torch.logsumexp(inputs, dim=-1)
+    target_logits = inputs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+    return (log_denom - target_logits).mean()
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -485,14 +766,87 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    grads = [param.grad for param in parameters if param.grad is not None]
+    if not grads:
+        return
+
+    total_norm = torch.sqrt(sum(torch.sum(grad.detach() ** 2) for grad in grads))
+    if total_norm > max_l2_norm:
+        scale = max_l2_norm / (total_norm + 1e-6)
+        for grad in grads:
+            grad.mul_(scale)
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    class AdamW(torch.optim.Optimizer):
+        def __init__(
+            self,
+            params,
+            lr: float = 1e-3,
+            betas: tuple[float, float] = (0.9, 0.999),
+            eps: float = 1e-8,
+            weight_decay: float = 0.01,
+        ):
+            if lr < 0:
+                raise ValueError(f"Invalid learning rate: {lr}")
+            if eps < 0:
+                raise ValueError(f"Invalid epsilon value: {eps}")
+            if not 0 <= betas[0] < 1:
+                raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+            if not 0 <= betas[1] < 1:
+                raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+            if weight_decay < 0:
+                raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+            defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+            super().__init__(params, defaults)
+
+        def step(self, closure=None):
+            loss = None
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+
+            for group in self.param_groups:
+                lr = group["lr"]
+                beta1, beta2 = group["betas"]
+                eps = group["eps"]
+                weight_decay = group["weight_decay"]
+
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    grad = p.grad
+                    if grad.is_sparse:
+                        raise RuntimeError("AdamW does not support sparse gradients")
+
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["step"] = 0
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+
+                    exp_avg = state["exp_avg"]
+                    exp_avg_sq = state["exp_avg_sq"]
+                    state["step"] += 1
+                    step = state["step"]
+
+                    p.data.mul_(1 - lr * weight_decay)
+
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                    bias_correction1 = 1 - beta1**step
+                    bias_correction2 = 1 - beta2**step
+                    step_size = lr / bias_correction1
+                    denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
+                    p.data.addcdiv_(exp_avg, denom, value=-step_size)
+
+            return loss
+
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -520,7 +874,14 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    if it < warmup_iters:
+        return max_learning_rate * it / warmup_iters
+    if it > cosine_cycle_iters:
+        return min_learning_rate
+
+    progress = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+    cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+    return min_learning_rate + cosine_decay * (max_learning_rate - min_learning_rate)
 
 
 def run_save_checkpoint(
@@ -539,7 +900,14 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "iteration": iteration,
+        },
+        out,
+    )
 
 
 def run_load_checkpoint(
@@ -560,7 +928,10 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    checkpoint = torch.load(src, map_location="cpu")
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    return checkpoint["iteration"]
 
 
 def get_tokenizer(

@@ -199,11 +199,11 @@ def train_bpe(
     else:
         chunks = [text] if text else []
 
-    word_freqs: dict[tuple[bytes, ...], int] = {}
+    word_freqs: dict[tuple[int, ...], int] = {}
     for chunk in chunks:
         for match in GPT2_PATTERN.finditer(chunk):
             pre_token = match.group(0)
-            word = tuple(bytes([b]) for b in pre_token.encode("utf-8"))
+            word = tuple(pre_token.encode("utf-8"))
             word_freqs[word] = word_freqs.get(word, 0) + 1
 
     vocab: dict[int, bytes] = {}
@@ -216,16 +216,66 @@ def train_bpe(
             vocab[len(vocab)] = token_bytes
 
     merges: list[tuple[bytes, bytes]] = []
+    pair_counts: dict[tuple[int, int], int] = {}
+    pair_to_words: dict[tuple[int, int], set[tuple[int, ...]]] = {}
+
+    for word, freq in word_freqs.items():
+        for i in range(len(word) - 1):
+            pair = (word[i], word[i + 1])
+            pair_counts[pair] = pair_counts.get(pair, 0) + freq
+            pair_to_words.setdefault(pair, set()).add(word)
 
     while len(vocab) < vocab_size:
-        pair_counts = _get_pair_counts(word_freqs)
         if not pair_counts:
             break
 
-        best_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
+        best_pair = max(
+            pair_counts.items(),
+            key=lambda x: (x[1], (vocab[x[0][0]], vocab[x[0][1]])),
+        )[0]
 
-        word_freqs = _merge_pair(word_freqs, best_pair)
-        merges.append(best_pair)
-        vocab[len(vocab)] = best_pair[0] + best_pair[1]
+        new_token_id = len(vocab)
+        vocab[new_token_id] = vocab[best_pair[0]] + vocab[best_pair[1]]
+        merges.append((vocab[best_pair[0]], vocab[best_pair[1]]))
+
+        affected: list[tuple[tuple[int, ...], int, tuple[int, ...]]] = []
+        for word in list(pair_to_words.get(best_pair, ())):
+            freq = word_freqs.get(word)
+            if freq is None:
+                continue
+
+            new_word: list[int] = []
+            i = 0
+            while i < len(word):
+                if i < len(word) - 1 and word[i] == best_pair[0] and word[i + 1] == best_pair[1]:
+                    new_word.append(new_token_id)
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            affected.append((word, freq, tuple(new_word)))
+
+        for word, freq, _ in affected:
+            del word_freqs[word]
+            pairs_in_word: set[tuple[int, int]] = set()
+            for i in range(len(word) - 1):
+                pair = (word[i], word[i + 1])
+                pairs_in_word.add(pair)
+                new_count = pair_counts[pair] - freq
+                if new_count:
+                    pair_counts[pair] = new_count
+                else:
+                    del pair_counts[pair]
+            for pair in pairs_in_word:
+                pair_to_words[pair].discard(word)
+                if not pair_to_words[pair]:
+                    del pair_to_words[pair]
+
+        for _, freq, word in affected:
+            word_freqs[word] = word_freqs.get(word, 0) + freq
+            for i in range(len(word) - 1):
+                pair = (word[i], word[i + 1])
+                pair_counts[pair] = pair_counts.get(pair, 0) + freq
+                pair_to_words.setdefault(pair, set()).add(word)
 
     return vocab, merges
